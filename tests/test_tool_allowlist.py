@@ -97,3 +97,55 @@ def test_env_parsing_rejects_empty():
     raw = "   ,  ,   "
     parsed = [t.strip() for t in raw.split(",") if t.strip()]
     assert parsed == []
+
+
+def test_post_import_validation_detects_zero_registered():
+    """Allowlist name absent from imported services must fail post-registration.
+
+    Reproduces `--tools gmail --tool-allowlist create_calendar_event` where the
+    allowlist promotes to the enabled set but no calendar tools are imported.
+    """
+    from core.tool_registry import get_tool_components
+
+    class _FakeProvider:
+        def __init__(self, names):
+            self._components = {f"tool:{n}@1": object() for n in names}
+
+    class _FakeServer:
+        def __init__(self, names):
+            self.local_provider = _FakeProvider(names)
+
+    # Imported gmail-only universe; allowlist asks for a calendar tool.
+    server = _FakeServer(["send_gmail_message", "get_gmail_attachment_content"])
+    allowlist = {"create_calendar_event"}
+    set_enabled_tools(allowlist)
+
+    # Simulate post-filter step: a real filter would drop everything not in
+    # the allowlist, leaving zero registered.
+    registered_after_filter = {
+        n for n in get_tool_components(server).keys() if n in allowlist
+    }
+    assert registered_after_filter == set()
+    _reset_registry()
+
+
+def test_post_import_validation_reports_missing_names():
+    """Allowlist names that don't map to imported tools should be reportable."""
+    from core.tool_registry import get_tool_components
+
+    class _FakeProvider:
+        def __init__(self, names):
+            self._components = {f"tool:{n}@1": object() for n in names}
+
+    class _FakeServer:
+        def __init__(self, names):
+            self.local_provider = _FakeProvider(names)
+
+    server = _FakeServer(["send_gmail_message", "get_gmail_attachment_content"])
+    allowlist = {"send_gmail_message", "create_calendar_event"}
+    registered = set(get_tool_components(server).keys()) & allowlist
+    missing = allowlist - registered
+
+    assert registered == {"send_gmail_message"}
+    assert missing == {"create_calendar_event"}
+    _reset_registry()

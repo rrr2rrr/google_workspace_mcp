@@ -630,22 +630,23 @@ def main():
             sys.exit(1)
         current_enabled = get_enabled_tools()
         if current_enabled is None:
-            # No prior tool filter (e.g. default mode or --tools only).
-            # The allowlist itself becomes the enabled set.
-            set_enabled_tool_names(allowlist)
+            # No prior tier filter (default mode or --tools-only). The
+            # allowlist becomes the enabled set; whether every name maps to
+            # an actually-imported tool is validated post-registration below.
+            applied = allowlist
         else:
-            narrowed = current_enabled & allowlist
-            if not narrowed:
+            applied = current_enabled & allowlist
+            if not applied:
                 safe_print(
                     "❌ --tool-allowlist filtered out every tool. "
                     "Allowlist: %s. Available before allowlist: %s"
                     % (sorted(allowlist), sorted(current_enabled))
                 )
                 sys.exit(1)
-            set_enabled_tool_names(narrowed)
+        set_enabled_tool_names(applied)
         logger.info(
-            "Tool allowlist applied: %d tool(s) will be registered",
-            len(allowlist),
+            "Tool allowlist applied: %d tool name(s) requested",
+            len(applied),
         )
 
     wrap_server_tool_method(server)
@@ -681,6 +682,34 @@ def main():
 
     # Filter tools based on tier configuration (if tier-based loading is enabled)
     filter_server_tools(server)
+
+    # Allowlist correctness: a name in the allowlist that doesn't belong to any
+    # imported service silently produces no registered tool. Validate post-filter
+    # so callers like `--tools gmail --tool-allowlist create_calendar_event`
+    # fail fast instead of starting empty.
+    if args.tool_allowlist:
+        from core.tool_registry import get_tool_components
+
+        registered = set(get_tool_components(server).keys())
+        if not registered:
+            safe_print(
+                "❌ --tool-allowlist / WORKSPACE_MCP_TOOL_ALLOWLIST resulted in "
+                "zero registered tools. Check that allowlist names match tools "
+                "provided by the services imported via --tools / --tool-tier. "
+                "Requested: %s" % sorted(allowlist)
+            )
+            sys.exit(1)
+        missing = allowlist - registered
+        if missing:
+            logger.warning(
+                "Allowlist names not registered (no matching imported tool): %s",
+                sorted(missing),
+            )
+        logger.info(
+            "Tool allowlist: %d tool(s) registered: %s",
+            len(registered),
+            sorted(registered),
+        )
 
     summary_parts = [f"{len(loaded)}/{len(tool_imports)} services"]
     if args.tool_tier is not None:
