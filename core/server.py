@@ -4,8 +4,11 @@ import asyncio
 import hashlib
 import logging
 import os
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 from importlib import metadata
+
+if TYPE_CHECKING:
+    from mcp.types import Icon
 
 from core.warning_filters import install_startup_warning_filters
 
@@ -159,7 +162,7 @@ When using Google Workspace tools, always use `{USER_GOOGLE_EMAIL}` as the `user
     logger.info(f"Server instructions configured for user: {USER_GOOGLE_EMAIL}")
 
 
-def _build_server_icons() -> Optional[list]:
+def _build_server_icons() -> Optional[List["Icon"]]:
     """Build the optional MCP server icon list from environment variables.
 
     Returns None when no icon is configured, so we fall back to FastMCP's
@@ -168,9 +171,18 @@ def _build_server_icons() -> Optional[list]:
         WORKSPACE_MCP_SERVER_ICON_URL   - https:// or data: URI of the icon
         WORKSPACE_MCP_SERVER_ICON_MIME  - optional, e.g. "image/png"
         WORKSPACE_MCP_SERVER_ICON_SIZES - optional, e.g. "48x48,96x96,256x256"
+
+    Only ``https://`` and ``data:`` schemes are accepted; any other value is
+    rejected so we don't advertise arbitrary or unsafe URIs to MCP clients.
     """
     src = os.getenv("WORKSPACE_MCP_SERVER_ICON_URL", "").strip()
     if not src:
+        return None
+    if not (src.startswith("https://") or src.startswith("data:")):
+        logger.warning(
+            "Ignoring WORKSPACE_MCP_SERVER_ICON_URL: only https:// and data: "
+            "URIs are accepted."
+        )
         return None
     try:
         # Imported lazily so the dependency surface is unchanged when no
@@ -187,14 +199,22 @@ def _build_server_icons() -> Optional[list]:
     sizes = [s.strip() for s in sizes_raw.split(",") if s.strip()] if sizes_raw else None
 
     icon = Icon(src=src, mimeType=mime, sizes=sizes)
-    logger.info("Server icon configured: %s", src)
+    # Don't log the full src: data: URIs can embed the icon payload and bloat
+    # logs (and accidentally leak in shared dashboards).
+    scheme = "data" if src.startswith("data:") else "https"
+    logger.info("Server icon configured (scheme=%s)", scheme)
     return [icon]
 
 
 _server_icons = _build_server_icons()
 _server_website_url = os.getenv("WORKSPACE_MCP_SERVER_WEBSITE_URL", "").strip() or None
+if _server_website_url and not _server_website_url.startswith("https://"):
+    logger.warning(
+        "Ignoring WORKSPACE_MCP_SERVER_WEBSITE_URL: only https:// URLs are accepted."
+    )
+    _server_website_url = None
 if _server_website_url:
-    logger.info("Server website_url configured: %s", _server_website_url)
+    logger.info("Server website_url configured (https)")
 
 server = SecureFastMCP(
     name="google_workspace",
