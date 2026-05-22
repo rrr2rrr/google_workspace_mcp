@@ -85,3 +85,52 @@ def test_blank_env_treated_as_unset(reload_server_module, monkeypatch):
 
     assert server_mod._server_icons is None
     assert server_mod._server_website_url is None
+
+
+def test_data_uri_icon_accepted(reload_server_module, monkeypatch):
+    monkeypatch.setenv(
+        "WORKSPACE_MCP_SERVER_ICON_URL",
+        "data:image/png;base64,iVBORw0KGgo=",
+    )
+    import core.server as server_mod
+    importlib.reload(server_mod)
+
+    icons = server_mod._server_icons
+    assert icons is not None and len(icons) == 1
+    assert icons[0].src.startswith("data:image/png;base64,")
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://example.com/icon.png",  # plain http
+        "javascript:alert(1)",
+        "file:///etc/passwd",
+        "ftp://example.com/icon.png",
+        "example.com/icon.png",
+    ],
+)
+def test_icon_url_rejects_unsupported_schemes(
+    reload_server_module, monkeypatch, bad_url
+):
+    monkeypatch.setenv("WORKSPACE_MCP_SERVER_ICON_URL", bad_url)
+    import core.server as server_mod
+    importlib.reload(server_mod)
+
+    assert server_mod._server_icons is None
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    [
+        "http://example.com",
+        "javascript:alert(1)",
+        "example.com",
+    ],
+)
+def test_website_url_rejects_non_https(reload_server_module, monkeypatch, bad_url):
+    monkeypatch.setenv("WORKSPACE_MCP_SERVER_WEBSITE_URL", bad_url)
+    import core.server as server_mod
+    importlib.reload(server_mod)
+
+    assert server_mod._server_website_url is None
