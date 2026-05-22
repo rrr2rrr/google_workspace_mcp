@@ -287,6 +287,24 @@ def main():
             "Mutually exclusive with --read-only and --tools."
         ),
     )
+    parser.add_argument(
+        "--tool-allowlist",
+        nargs="+",
+        metavar="TOOL_NAME",
+        default=None,
+        help=(
+            "Restrict registered tools to this exact list of tool names. "
+            "Narrows whatever set --tool-tier, --tools, --read-only or "
+            "--permissions would otherwise enable; only the named tools are "
+            "registered with the MCP server. Useful when a deployment needs "
+            "a small subset of tools without authoring a custom tier "
+            "(e.g. --tool-allowlist get_gmail_attachment_content "
+            "send_gmail_message). "
+            "Also configurable via WORKSPACE_MCP_TOOL_ALLOWLIST "
+            "(comma-separated). Tools not present in the resolved selection "
+            "(after tier/services/permissions) are silently dropped."
+        ),
+    )
     args = parser.parse_args()
 
     # Env var fallbacks for plugin users who configure via userConfig.
@@ -357,6 +375,19 @@ def main():
             "WORKSPACE_MCP_PERMISSIONS ignored because %s was provided on the CLI",
             " and ".join(_conflicts),
         )
+    if args.tool_allowlist is None:
+        _env_allowlist = os.getenv("WORKSPACE_MCP_TOOL_ALLOWLIST", "").strip()
+        if _env_allowlist:
+            _parsed_allowlist = [
+                t.strip() for t in _env_allowlist.split(",") if t.strip()
+            ]
+            if not _parsed_allowlist:
+                _exit_with_env_error(
+                    "WORKSPACE_MCP_TOOL_ALLOWLIST",
+                    _env_allowlist,
+                    "comma-separated tool names",
+                )
+            args.tool_allowlist = _parsed_allowlist
     if args.transport is None:
         _env_transport = os.getenv("WORKSPACE_MCP_TRANSPORT", "").strip().lower()
         if _env_transport:
@@ -584,6 +615,38 @@ def main():
         tools_to_import = tool_imports.keys()
         # Don't filter individual tools when importing all
         set_enabled_tool_names(None)
+
+    # Optional final filter: narrow registered tools to an explicit allowlist.
+    # Applies on top of tier / services / read-only / permissions selection.
+    if args.tool_allowlist:
+        from core.tool_registry import get_enabled_tools
+
+        allowlist = {t.strip() for t in args.tool_allowlist if t.strip()}
+        if not allowlist:
+            safe_print(
+                "❌ --tool-allowlist / WORKSPACE_MCP_TOOL_ALLOWLIST produced an "
+                "empty set of tool names"
+            )
+            sys.exit(1)
+        current_enabled = get_enabled_tools()
+        if current_enabled is None:
+            # No prior tool filter (e.g. default mode or --tools only).
+            # The allowlist itself becomes the enabled set.
+            set_enabled_tool_names(allowlist)
+        else:
+            narrowed = current_enabled & allowlist
+            if not narrowed:
+                safe_print(
+                    "❌ --tool-allowlist filtered out every tool. "
+                    "Allowlist: %s. Available before allowlist: %s"
+                    % (sorted(allowlist), sorted(current_enabled))
+                )
+                sys.exit(1)
+            set_enabled_tool_names(narrowed)
+        logger.info(
+            "Tool allowlist applied: %d tool(s) will be registered",
+            len(allowlist),
+        )
 
     wrap_server_tool_method(server)
 
