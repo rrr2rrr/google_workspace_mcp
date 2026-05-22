@@ -158,10 +158,50 @@ if USER_GOOGLE_EMAIL:
 When using Google Workspace tools, always use `{USER_GOOGLE_EMAIL}` as the `user_google_email` parameter. Do not ask the user for their email address."""
     logger.info(f"Server instructions configured for user: {USER_GOOGLE_EMAIL}")
 
+
+def _build_server_icons() -> Optional[list]:
+    """Build the optional MCP server icon list from environment variables.
+
+    Returns None when no icon is configured, so we fall back to FastMCP's
+    default (no icon advertised). Reads:
+
+        WORKSPACE_MCP_SERVER_ICON_URL   - https:// or data: URI of the icon
+        WORKSPACE_MCP_SERVER_ICON_MIME  - optional, e.g. "image/png"
+        WORKSPACE_MCP_SERVER_ICON_SIZES - optional, e.g. "48x48,96x96,256x256"
+    """
+    src = os.getenv("WORKSPACE_MCP_SERVER_ICON_URL", "").strip()
+    if not src:
+        return None
+    try:
+        # Imported lazily so the dependency surface is unchanged when no
+        # icon is configured.
+        from mcp.types import Icon
+    except ImportError:  # pragma: no cover - mcp is a hard dep, but be safe
+        logger.warning(
+            "Could not import mcp.types.Icon; ignoring WORKSPACE_MCP_SERVER_ICON_URL"
+        )
+        return None
+
+    mime = os.getenv("WORKSPACE_MCP_SERVER_ICON_MIME", "").strip() or None
+    sizes_raw = os.getenv("WORKSPACE_MCP_SERVER_ICON_SIZES", "").strip()
+    sizes = [s.strip() for s in sizes_raw.split(",") if s.strip()] if sizes_raw else None
+
+    icon = Icon(src=src, mimeType=mime, sizes=sizes)
+    logger.info("Server icon configured: %s", src)
+    return [icon]
+
+
+_server_icons = _build_server_icons()
+_server_website_url = os.getenv("WORKSPACE_MCP_SERVER_WEBSITE_URL", "").strip() or None
+if _server_website_url:
+    logger.info("Server website_url configured: %s", _server_website_url)
+
 server = SecureFastMCP(
     name="google_workspace",
     auth=None,
     instructions=_server_instructions,
+    icons=_server_icons,
+    website_url=_server_website_url,
 )
 
 # Add the AuthInfo middleware to inject authentication into FastMCP context
