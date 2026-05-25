@@ -378,16 +378,16 @@ def main():
     if args.tool_allowlist is None:
         _env_allowlist = os.getenv("WORKSPACE_MCP_TOOL_ALLOWLIST", "").strip()
         if _env_allowlist:
-            _parsed_allowlist = [
-                t.strip() for t in _env_allowlist.split(",") if t.strip()
-            ]
-            if not _parsed_allowlist:
+            _raw_tokens = _env_allowlist.split(",")
+            # Reject mixed empty entries (`a,,b`) — likely a typo, not a deliberate
+            # value. The all-empty case (`   ,  ,   `) is also caught here.
+            if any(not t.strip() for t in _raw_tokens):
                 _exit_with_env_error(
                     "WORKSPACE_MCP_TOOL_ALLOWLIST",
                     _env_allowlist,
                     "comma-separated tool names",
                 )
-            args.tool_allowlist = _parsed_allowlist
+            args.tool_allowlist = [t.strip() for t in _raw_tokens]
     if args.transport is None:
         _env_transport = os.getenv("WORKSPACE_MCP_TRANSPORT", "").strip().lower()
         if _env_transport:

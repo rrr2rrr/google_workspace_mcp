@@ -153,7 +153,11 @@ def test_post_import_validation_reports_missing_names() -> None:
 
 
 def test_env_parsing_rejects_mixed_empty_entries() -> None:
-    """Mixed empty entries like 'a,,b' should be detectable so the env var can fail fast."""
+    """Mixed empty entries like 'a,,b' should be detectable so the env var can fail fast.
+
+    Mirrors the validation in main.py: split on ',' (no `if t.strip()` filter)
+    so an empty middle token surfaces as a rejectable entry.
+    """
     raw = "send_gmail_message,,get_gmail_attachment_content"
-    tokens = [t.strip() for t in raw.split(",")]
-    assert any(not t for t in tokens)
+    raw_tokens = raw.split(",")
+    assert any(not t.strip() for t in raw_tokens)
