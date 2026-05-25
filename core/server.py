@@ -664,6 +664,54 @@ async def serve_attachment(request: Request):
     )
 
 
+def _resolve_favicon_dir() -> str:
+    """Return the directory to search for favicon assets.
+
+    Resolution order:
+    1. WORKSPACE_MCP_FAVICON_DIR (explicit override).
+    2. The configured credentials directory — the existing persistent-storage
+       mount in the default Docker setup. This lets operators drop a favicon
+       into the already-mounted volume (e.g. ``docker cp favicon.ico
+       gws_mcp:/app/store_creds/``) without editing docker-compose / Dockerfile.
+    3. The default credentials path under the user's home dir.
+    """
+    explicit = os.getenv("WORKSPACE_MCP_FAVICON_DIR", "").strip()
+    if explicit:
+        return os.path.expanduser(explicit)
+    for env_name in ("WORKSPACE_MCP_CREDENTIALS_DIR", "GOOGLE_MCP_CREDENTIALS_DIR"):
+        creds_dir = os.getenv(env_name, "").strip()
+        if creds_dir:
+            return os.path.expanduser(creds_dir)
+    return os.path.join(os.path.expanduser("~"), ".google_workspace_mcp", "credentials")
+
+
+async def _serve_favicon_file(filename: str, media_type: str):
+    """Serve a favicon asset from the resolved favicon directory, or 404."""
+    candidate = os.path.join(_resolve_favicon_dir(), filename)
+    if not os.path.isfile(candidate):
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return FileResponse(
+        path=candidate,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
+
+
+@server.custom_route("/favicon.ico", methods=["GET"])
+async def favicon_ico(request: Request):
+    return await _serve_favicon_file("favicon.ico", "image/vnd.microsoft.icon")
+
+
+@server.custom_route("/favicon.png", methods=["GET"])
+async def favicon_png(request: Request):
+    return await _serve_favicon_file("favicon.png", "image/png")
+
+
+@server.custom_route("/apple-touch-icon.png", methods=["GET"])
+async def apple_touch_icon(request: Request):
+    return await _serve_favicon_file("apple-touch-icon.png", "image/png")
+
+
 async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
     state = request.query_params.get("state")
     code = request.query_params.get("code")
