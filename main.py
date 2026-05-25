@@ -638,9 +638,9 @@ def main():
             applied = current_enabled & allowlist
             if not applied:
                 safe_print(
-                    "❌ --tool-allowlist filtered out every tool. "
-                    "Allowlist: %s. Available before allowlist: %s"
-                    % (sorted(allowlist), sorted(current_enabled))
+                    f"❌ --tool-allowlist filtered out every tool. "
+                    f"Allowlist: {sorted(allowlist)}. "
+                    f"Available before allowlist: {sorted(current_enabled)}"
                 )
                 sys.exit(1)
         set_enabled_tool_names(applied)
@@ -693,17 +693,28 @@ def main():
         registered = set(get_tool_components(server).keys())
         if not registered:
             safe_print(
-                "❌ --tool-allowlist / WORKSPACE_MCP_TOOL_ALLOWLIST resulted in "
-                "zero registered tools. Check that allowlist names match tools "
-                "provided by the services imported via --tools / --tool-tier. "
-                "Requested: %s" % sorted(allowlist)
+                f"❌ --tool-allowlist / WORKSPACE_MCP_TOOL_ALLOWLIST resulted in "
+                f"zero registered tools. Check that allowlist names match tools "
+                f"provided by the services imported via --tools / --tool-tier. "
+                f"Requested: {sorted(allowlist)}"
             )
             sys.exit(1)
-        missing = allowlist - registered
+        # Two distinct cases for an allowlisted name that didn't register:
+        #   1. Tier/service selection dropped it before registration (`applied`).
+        #      Expected — the user asked for a narrowed set.
+        #   2. It survived intersection but matches no imported tool (`registered`).
+        #      Likely a typo or wrong tier.
+        missing = applied - registered
         if missing:
             logger.warning(
                 "Allowlist names not registered (no matching imported tool): %s",
                 sorted(missing),
+            )
+        filtered = allowlist - applied
+        if filtered:
+            logger.info(
+                "Allowlist names dropped by tier/service selection: %s",
+                sorted(filtered),
             )
         logger.info(
             "Tool allowlist: %d tool(s) registered: %s",
