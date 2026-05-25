@@ -31,7 +31,7 @@ from core.config import (
     set_transport_mode as _set_transport_mode,
     get_oauth_redirect_uri as get_oauth_redirect_uri_for_current_mode,
 )
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
 from mcp.types import ToolAnnotations
@@ -685,7 +685,7 @@ def _resolve_favicon_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".google_workspace_mcp", "credentials")
 
 
-async def _serve_favicon_file(filename: str, media_type: str):
+async def _serve_favicon_file(filename: str, media_type: str) -> Response:
     """Serve a favicon asset from the resolved favicon directory, or 404."""
     candidate = os.path.join(_resolve_favicon_dir(), filename)
     if not os.path.isfile(candidate):
@@ -698,17 +698,17 @@ async def _serve_favicon_file(filename: str, media_type: str):
 
 
 @server.custom_route("/favicon.ico", methods=["GET"])
-async def favicon_ico(request: Request):
+async def favicon_ico(request: Request) -> Response:
     return await _serve_favicon_file("favicon.ico", "image/vnd.microsoft.icon")
 
 
 @server.custom_route("/favicon.png", methods=["GET"])
-async def favicon_png(request: Request):
+async def favicon_png(request: Request) -> Response:
     return await _serve_favicon_file("favicon.png", "image/png")
 
 
 @server.custom_route("/apple-touch-icon.png", methods=["GET"])
-async def apple_touch_icon(request: Request):
+async def apple_touch_icon(request: Request) -> Response:
     return await _serve_favicon_file("apple-touch-icon.png", "image/png")
 
 
