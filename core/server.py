@@ -34,6 +34,7 @@ from core.config import (
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, Response
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.google import GoogleProvider
+from auth.google_provider import SlidingRefreshGoogleProvider
 from mcp.types import ToolAnnotations
 from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
@@ -570,7 +571,7 @@ def configure_server_for_http():
                         "OAuth 2.1: restricting DCR client redirect URIs to allowlist: %s",
                         allowed_client_redirect_uris,
                     )
-                provider = GoogleProvider(
+                provider = SlidingRefreshGoogleProvider(
                     client_id=config.client_id,
                     client_secret=config.client_secret,
                     base_url=config.get_oauth_base_url(),

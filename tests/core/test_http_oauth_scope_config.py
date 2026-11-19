@@ -20,7 +20,9 @@ def test_configure_server_for_http_uses_protocol_auth_required_scopes(monkeypatc
             self._cimd_manager = SimpleNamespace(default_scope=default_scope)
 
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", FakeGoogleProvider)
+    monkeypatch.setattr(
+        server_module, "SlidingRefreshGoogleProvider", FakeGoogleProvider
+    )
     monkeypatch.setattr(
         server_module,
         "get_current_scopes",
@@ -82,7 +84,9 @@ def test_configure_server_for_http_supports_public_client_with_jwt_key(monkeypat
         "this-is-a-long-enough-jwt-signing-key",
     )
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", FakeGoogleProvider)
+    monkeypatch.setattr(
+        server_module, "SlidingRefreshGoogleProvider", FakeGoogleProvider
+    )
     monkeypatch.setattr(
         server_module,
         "get_current_scopes",
@@ -122,7 +126,7 @@ def test_configure_server_for_http_rejects_public_client_without_jwt_key(
 ):
     monkeypatch.delenv("FASTMCP_SERVER_AUTH_GOOGLE_JWT_SIGNING_KEY", raising=False)
     monkeypatch.setattr(server_module, "get_transport_mode", lambda: "streamable-http")
-    monkeypatch.setattr(server_module, "GoogleProvider", object)
+    monkeypatch.setattr(server_module, "SlidingRefreshGoogleProvider", object)
     monkeypatch.setattr(server_module, "set_auth_provider", lambda provider: None)
     monkeypatch.setattr(server_module, "_auth_provider", server_module._auth_provider)
     monkeypatch.setattr(server_module.server, "auth", server_module.server.auth)
