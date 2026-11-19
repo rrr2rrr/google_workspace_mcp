@@ -1,5 +1,5 @@
 """
-Regression tests for the 30-day OAuth 2.1 session cliff.
+Regression tests for the fixed-deadline OAuth 2.1 session cliff.
 
 Simulates Google's token endpoint (which never returns ``refresh_expires_in``
 and does not rotate refresh tokens) and drives FastMCP's real OAuthProxy code
@@ -10,10 +10,13 @@ import time
 from urllib.parse import parse_qs
 
 import fastmcp.server.auth.oauth_proxy.proxy as proxy_module
-import httpx
+import httpx2 as httpx  # authlib's httpx_client is built on httpx2
 import pytest
 from authlib.integrations.httpx_client import AsyncOAuth2Client
-from fastmcp.server.auth.oauth_proxy.models import ClientCode
+from fastmcp.server.auth.oauth_proxy.models import (
+    DEFAULT_REFRESH_TOKEN_EXPIRY_SECONDS,
+    ClientCode,
+)
 from fastmcp.server.auth.providers.google import GoogleProvider
 from key_value.aio.stores.memory import MemoryStore
 from mcp.server.auth.provider import AuthorizationCode
@@ -134,13 +137,17 @@ async def _refresh(provider, client, fastmcp_refresh_token):
 
 
 @pytest.mark.asyncio
-async def test_baseline_google_provider_has_fixed_30_day_deadline():
-    """Documents the upstream bug: refresh does not extend the session."""
+async def test_baseline_google_provider_has_fixed_deadline():
+    """Documents the upstream bug: refresh does not extend the session.
+
+    If this starts failing after a FastMCP upgrade, upstream may have fixed
+    sliding expiry and SlidingRefreshGoogleProvider may no longer be needed.
+    """
     provider = _make_provider(GoogleProvider)
     client, token = await _connect(provider)
     upstream, _ = await _upstream_for(provider, token.refresh_token)
     assert upstream.refresh_token_expires_at - time.time() == pytest.approx(
-        30 * DAY, abs=60
+        DEFAULT_REFRESH_TOKEN_EXPIRY_SECONDS, abs=60
     )
 
     await _age_session(provider, token.refresh_token, remaining_seconds=DAY)

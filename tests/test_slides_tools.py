@@ -1,12 +1,13 @@
+import base64
 from unittest.mock import Mock
 
+import httpx
 import pytest
+from fastmcp.tools import ToolResult
 
 from core.utils import UserInputError
+from gslides import slides_tools
 from gslides.slides_tools import (
-    _describe_elements,
-    _extract_shape_text,
-    _iter_text_bearing_elements,
     batch_update_presentation,
 )
 
@@ -150,7 +151,7 @@ async def test_batch_update_rejects_insert_text_targeting_other_page_ids():
     presentations.get.assert_called_once_with(
         presentationId="presentation-1",
         fields=(
-            "slides(objectId,slideProperties(notesPage(objectId))),masters(objectId),layouts(objectId),notesMaster(objectId)"
+            "slides(objectId,slideProperties(notesPage(objectId,notesProperties(speakerNotesObjectId)))),masters(objectId),layouts(objectId),notesMaster(objectId)"
         ),
     )
     presentations.batchUpdate.assert_not_called()
@@ -199,6 +200,44 @@ async def test_batch_update_allows_insert_text_targeting_created_shape():
 
 
 @pytest.mark.asyncio
+async def test_batch_update_reports_replace_all_text_counts() -> None:
+    """replaceAllText replies report how many occurrences changed, including none."""
+    service, _ = _build_slides_service(
+        batch_update_response={
+            "replies": [
+                {"replaceAllText": {"occurrencesChanged": 3}},
+                {"replaceAllText": {}},
+            ]
+        }
+    )
+    requests = [
+        {
+            "replaceAllText": {
+                "containsText": {"text": "{{name}}"},
+                "replaceText": "Ada",
+            }
+        },
+        {
+            "replaceAllText": {
+                "containsText": {"text": "{{missing}}"},
+                "replaceText": "x",
+            }
+        },
+    ]
+
+    result = await _unwrap(batch_update_presentation)(
+        service=service,
+        user_google_email="user@example.com",
+        presentation_id="presentation-1",
+        requests=requests,
+    )
+
+    assert "Request 1: Replaced 3 occurrence(s)" in result
+    assert "Request 2: Replaced 0 occurrence(s)" in result
+    assert "Operation completed" not in result
+
+
+@pytest.mark.asyncio
 async def test_batch_update_rejects_insert_text_targeting_new_slide_id():
     service, presentations = _build_slides_service(presentation={"slides": []})
 
@@ -223,7 +262,7 @@ async def test_batch_update_rejects_insert_text_targeting_new_slide_id():
     presentations.batchUpdate.assert_not_called()
 
 
-# --- Tests for text-extraction helpers used by get_page / get_presentation ---
+# --- Tests for speaker notes reporting and insertText redirection ---
 
 
 def _text_shape(content):
@@ -238,157 +277,277 @@ def _text_shape(content):
     }
 
 
-def test_extract_shape_text_joins_runs_in_start_index_order():
-    shape = {
-        "text": {
-            "textElements": [
-                {"startIndex": 7, "textRun": {"content": "world!"}},
-                {"startIndex": 0, "textRun": {"content": "Hello, "}},
-            ]
-        }
+def _slide_with_notes(slide_id="slide_1", notes_object_id="notes_shape_1", text=None):
+    """Build a slide resource carrying a notes page, as presentations.get returns."""
+    notes_page = {
+        "objectId": f"{slide_id}_notes",
+        "notesProperties": {"speakerNotesObjectId": notes_object_id}
+        if notes_object_id
+        else {},
+        "pageElements": [],
     }
-    assert _extract_shape_text(shape) == "Hello, world!"
-
-
-def test_extract_shape_text_handles_missing_or_empty_inputs():
-    assert _extract_shape_text(None) == ""
-    assert _extract_shape_text({}) == ""
-    assert _extract_shape_text({"shapeType": "RECTANGLE"}) == ""
-    assert _extract_shape_text({"text": {"textElements": []}}) == ""
-
-
-def test_extract_shape_text_skips_textelements_without_textrun():
-    shape = {
-        "text": {
-            "textElements": [
-                {"startIndex": 0, "paragraphMarker": {}},
-                {"startIndex": 0, "textRun": {"content": "actual text"}},
-            ]
-        }
+    if text is not None:
+        element = _text_shape(text)
+        element["objectId"] = notes_object_id
+        notes_page["pageElements"].append(element)
+    return {
+        "objectId": slide_id,
+        "slideProperties": {"notesPage": notes_page},
     }
-    assert _extract_shape_text(shape) == "actual text"
 
 
-def test_iter_text_bearing_elements_recurses_into_groups():
-    elements = [
-        _text_shape("top-level"),
+@pytest.mark.asyncio
+async def test_batch_update_redirects_insert_text_from_notes_page_to_notes_shape():
+    service, presentations = _build_slides_service(
+        presentation={
+            "slides": [_slide_with_notes("slide_1", "notes_shape_1")],
+        }
+    )
+
+    with pytest.raises(UserInputError) as exc_info:
+        await _unwrap(batch_update_presentation)(
+            service=service,
+            user_google_email="user@example.com",
+            presentation_id="presentation-1",
+            requests=[
+                {
+                    "insertText": {
+                        "objectId": "slide_1_notes",
+                        "insertionIndex": 0,
+                        "text": "Talk track",
+                    }
+                }
+            ],
+        )
+
+    message = str(exc_info.value)
+    assert "requests[0].insertText.objectId='slide_1_notes'" in message
+    assert "targets a notes page" in message
+    assert "use objectId 'notes_shape_1' instead" in message
+    # The createShape guidance is wrong for notes and must not be appended.
+    assert "createShape" not in message
+    presentations.batchUpdate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_batch_update_keeps_shape_guidance_when_a_slide_id_is_also_targeted():
+    service, _ = _build_slides_service(
+        presentation={"slides": [_slide_with_notes("slide_1", "notes_shape_1")]}
+    )
+
+    with pytest.raises(UserInputError) as exc_info:
+        await _unwrap(batch_update_presentation)(
+            service=service,
+            user_google_email="user@example.com",
+            presentation_id="presentation-1",
+            requests=[
+                {
+                    "insertText": {
+                        "objectId": "slide_1_notes",
+                        "insertionIndex": 0,
+                        "text": "Notes",
+                    }
+                },
+                {
+                    "insertText": {
+                        "objectId": "slide_1",
+                        "insertionIndex": 0,
+                        "text": "Title",
+                    }
+                },
+            ],
+        )
+
+    message = str(exc_info.value)
+    assert "use objectId 'notes_shape_1' instead" in message
+    assert "requests[1].insertText.objectId='slide_1' targets a slide/page object" in (
+        message
+    )
+    assert "createShape" in message
+
+
+@pytest.mark.asyncio
+async def test_batch_update_allows_insert_text_into_the_speaker_notes_shape():
+    service, presentations = _build_slides_service(
+        presentation={
+            "slides": [_slide_with_notes("slide_1", "notes_shape_1", "Old\n")]
+        }
+    )
+    requests = [
+        {"deleteText": {"objectId": "notes_shape_1", "textRange": {"type": "ALL"}}},
         {
-            "elementGroup": {
-                "children": [
-                    _text_shape("nested"),
-                    {
-                        "elementGroup": {
-                            "children": [_text_shape("deep")],
-                        }
-                    },
-                ]
+            "insertText": {
+                "objectId": "notes_shape_1",
+                "insertionIndex": 0,
+                "text": "New talk track",
             }
         },
     ]
-    assert list(_iter_text_bearing_elements(elements)) == [
-        "top-level",
-        "nested",
-        "deep",
-    ]
+
+    result = await _unwrap(batch_update_presentation)(
+        service=service,
+        user_google_email="user@example.com",
+        presentation_id="presentation-1",
+        requests=requests,
+    )
+
+    assert presentations.batchUpdate.call_args.kwargs["body"] == {"requests": requests}
+    assert "Batch Update Completed" in result
 
 
-def test_iter_text_bearing_elements_skips_empty_shapes_and_non_shape_types():
-    elements = [
-        {"shape": {"shapeType": "RECTANGLE"}},
-        {"table": {"rows": 2, "columns": 2}},
-        {"line": {"lineType": "STRAIGHT"}},
-        {"image": {}},
-        _text_shape("only-text"),
-    ]
-    assert list(_iter_text_bearing_elements(elements)) == ["only-text"]
+class TestRenderPageToImage:
+    URL = "https://lh7-us.googleusercontent.com/thumb.png"
 
-
-def test_iter_text_bearing_elements_handles_empty_and_none_input():
-    assert list(_iter_text_bearing_elements([])) == []
-    assert list(_iter_text_bearing_elements(None)) == []
-
-
-def test_describe_elements_renders_single_line_text_inline():
-    elements = [{"objectId": "s1", **_text_shape("Hello")}]
-    assert _describe_elements(elements) == [
-        '  Shape: ID s1, Type: TEXT_BOX, Text: "Hello"'
-    ]
-
-
-def test_describe_elements_renders_multiline_text_as_blockquote():
-    elements = [
-        {
-            "objectId": "s1",
-            "shape": {
-                "shapeType": "TEXT_BOX",
-                "text": {
-                    "textElements": [
-                        {
-                            "startIndex": 0,
-                            "textRun": {"content": "line one\nline two\nline three"},
-                        }
-                    ]
-                },
-            },
+    def _service(self):
+        service = Mock()
+        service.presentations.return_value.pages.return_value.getThumbnail.return_value.execute.return_value = {
+            "contentUrl": self.URL
         }
-    ]
-    assert _describe_elements(elements) == [
-        "  Shape: ID s1, Type: TEXT_BOX, Text:",
-        "    > line one",
-        "    > line two",
-        "    > line three",
-    ]
+        return service
 
+    @staticmethod
+    def _mock_fetch(monkeypatch, handler):
+        real_client = httpx.AsyncClient
+        monkeypatch.setattr(
+            slides_tools.httpx,
+            "AsyncClient",
+            lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+        )
 
-def test_describe_elements_recurses_into_groups_with_deeper_indent():
-    elements = [
-        {
-            "objectId": "g1",
-            "elementGroup": {
-                "children": [
-                    {"objectId": "child1", **_text_shape("inside")},
-                    {
-                        "objectId": "g2",
-                        "elementGroup": {
-                            "children": [
-                                {"objectId": "grandchild", **_text_shape("deeper")}
-                            ]
-                        },
-                    },
-                ]
-            },
+    @staticmethod
+    def _png_handler(png=b"\x89PNG\r\n\x1a\nfake"):
+        def handler(request):
+            assert request.url.host == "lh7-us.googleusercontent.com"
+            return httpx.Response(
+                200, content=png, headers={"content-type": "image/png"}
+            )
+
+        return handler
+
+    @pytest.mark.asyncio
+    async def test_returns_png_image_content_by_default(self, monkeypatch):
+        png = b"\x89PNG\r\n\x1a\nfake"
+        self._mock_fetch(monkeypatch, self._png_handler(png))
+        service = self._service()
+        out = await _unwrap(slides_tools.render_page_to_image)(
+            service, "u@example.com", "pres", "p1"
+        )
+        assert isinstance(out, ToolResult)
+        text, image = out.content
+        assert "pres" in text.text and "p1" in text.text
+        assert "MEDIUM" in text.text
+        assert self.URL in text.text
+        assert "30 minutes" in text.text
+        assert image.type == "image" and image.mime_type == "image/png"
+        assert base64.b64decode(image.data) == png
+        assert out.structured_content == {"result": text.text}
+        get_thumbnail = (
+            service.presentations.return_value.pages.return_value.getThumbnail
+        )
+        assert (
+            get_thumbnail.call_args.kwargs["thumbnailProperties_thumbnailSize"]
+            == "MEDIUM"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "size, width",
+        [("SMALL", 200), ("MEDIUM", 800), ("LARGE", 1600), ("WIDTH2000_PX", 2000)],
+    )
+    async def test_each_valid_size_is_passed_to_the_api(self, monkeypatch, size, width):
+        self._mock_fetch(monkeypatch, self._png_handler())
+        service = self._service()
+        out = await _unwrap(slides_tools.render_page_to_image)(
+            service, "u@example.com", "pres", "p1", size=size
+        )
+        get_thumbnail = (
+            service.presentations.return_value.pages.return_value.getThumbnail
+        )
+        get_thumbnail.assert_called_once_with(
+            presentationId="pres",
+            pageObjectId="p1",
+            thumbnailProperties_thumbnailSize=size,
+            thumbnailProperties_mimeType="PNG",
+        )
+        assert f"{size} ({width}px wide)" in out.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_reports_dimensions_returned_by_the_api(self, monkeypatch):
+        self._mock_fetch(monkeypatch, self._png_handler())
+        service = self._service()
+        service.presentations.return_value.pages.return_value.getThumbnail.return_value.execute.return_value = {
+            "contentUrl": self.URL,
+            "width": 450,
+            "height": 800,
         }
-    ]
-    assert _describe_elements(elements) == [
-        "  Group: ID g1, Children: 2",
-        '    Shape: ID child1, Type: TEXT_BOX, Text: "inside"',
-        "    Group: ID g2, Children: 1",
-        '      Shape: ID grandchild, Type: TEXT_BOX, Text: "deeper"',
-    ]
+        out = await _unwrap(slides_tools.render_page_to_image)(
+            service, "u@example.com", "pres", "p1"
+        )
+        assert "MEDIUM (450x800px)" in out.content[0].text
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("size", ["HUGE", "medium", ""])
+    async def test_invalid_size_is_rejected_before_calling_the_api(self, size):
+        service = self._service()
+        with pytest.raises(UserInputError) as exc_info:
+            await _unwrap(slides_tools.render_page_to_image)(
+                service, "u@example.com", "pres", "p1", size=size
+            )
+        message = str(exc_info.value)
+        for valid in ("SMALL", "MEDIUM", "LARGE", "WIDTH2000_PX"):
+            assert valid in message
+        service.presentations.assert_not_called()
 
-def test_describe_elements_labels_non_text_element_types():
-    elements = [
-        {"objectId": "t1", "table": {"rows": 3, "columns": 2}},
-        {"objectId": "l1", "line": {"lineType": "STRAIGHT"}},
-        {"objectId": "x1", "image": {}},
-    ]
-    assert _describe_elements(elements) == [
-        "  Table: ID t1, Size: 3x2",
-        "  Line: ID l1, Type: STRAIGHT",
-        "  Element: ID x1, Type: Unknown",
-    ]
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "response",
+        [
+            httpx.Response(403),
+            httpx.Response(
+                200, content=b"<html>", headers={"content-type": "text/html"}
+            ),
+            httpx.Response(
+                200, content=b"<svg/>", headers={"content-type": "image/svg+xml"}
+            ),
+            httpx.Response(
+                200,
+                content=b"\x89PNG\r\n\x1a\nfake",
+                headers={"content-type": "text/html"},
+            ),
+            httpx.Response(200, content=b"\x89PNG\r\n\x1a\nfake"),
+            httpx.ConnectError("unreachable"),
+        ],
+    )
+    async def test_fetch_failure_falls_back_to_text_with_url(
+        self, monkeypatch, response
+    ):
+        def handler(request):
+            if isinstance(response, Exception):
+                raise response
+            return response
 
+        self._mock_fetch(monkeypatch, handler)
+        out = await _unwrap(slides_tools.render_page_to_image)(
+            self._service(), "u@example.com", "pres", "p1"
+        )
+        assert isinstance(out, ToolResult)
+        assert len(out.content) == 1
+        text = out.content[0].text
+        assert self.URL in text
+        assert "Image unavailable" in text
+        assert out.structured_content == {"result": text}
 
-def test_describe_elements_keeps_shape_without_text_simple():
-    elements = [
-        {"objectId": "s1", "shape": {"shapeType": "RECTANGLE"}},
-    ]
-    assert _describe_elements(elements) == [
-        "  Shape: ID s1, Type: RECTANGLE",
-    ]
-
-
-def test_describe_elements_handles_empty_and_none_input():
-    assert _describe_elements([]) == []
-    assert _describe_elements(None) == []
+    @pytest.mark.asyncio
+    async def test_fetch_failure_keeps_url_out_of_logs(self, monkeypatch, caplog):
+        self._mock_fetch(monkeypatch, lambda request: httpx.Response(403))
+        with caplog.at_level("DEBUG", logger=slides_tools.logger.name):
+            await _unwrap(slides_tools.render_page_to_image)(
+                self._service(), "u@example.com", "pres", "p1"
+            )
+        # httpx's own request log is held at WARNING by main.py, so only the
+        # tool's records are checked here.
+        tool_logs = " ".join(
+            r.getMessage() for r in caplog.records if r.name == slides_tools.logger.name
+        )
+        assert "Image fetch failed" in tool_logs
+        assert "googleusercontent" not in tool_logs

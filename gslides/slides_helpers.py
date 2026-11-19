@@ -5,12 +5,17 @@ Shared utilities for Google Slides operations.
 """
 
 import asyncio
-from typing import Any, Dict, List, Set, Tuple
+import difflib
+import json
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from core.utils import UserInputError
+from gslides.slides_digest import format_deck, format_layouts, format_page
+from gslides.slides_markup import iter_elements, project_page
 
 _PRESENTATION_PAGE_ID_FIELDS = (
-    "slides(objectId,slideProperties(notesPage(objectId))),"
+    "slides(objectId,slideProperties(notesPage(objectId,"
+    "notesProperties(speakerNotesObjectId)))),"
     "masters(objectId),layouts(objectId),notesMaster(objectId)"
 )
 
@@ -71,6 +76,26 @@ _SLIDES_BATCH_REQUEST_EXAMPLES = (
     "createImage",
     "deleteObject",
 )
+
+
+# getThumbnail thumbnailSize values and the pixel width each renders at.
+PAGE_IMAGE_WIDTHS = {
+    "SMALL": 200,
+    "MEDIUM": 800,
+    "LARGE": 1600,
+    "WIDTH2000_PX": 2000,
+}
+
+
+def validate_page_image_size(size: str) -> int:
+    """Check a render size against the API's values and return its pixel width."""
+    width = PAGE_IMAGE_WIDTHS.get(size)
+    if width is None:
+        valid = ", ".join(
+            f"{name} ({px}px wide)" for name, px in PAGE_IMAGE_WIDTHS.items()
+        )
+        raise UserInputError(f"Invalid size '{size}'. Use one of: {valid}.")
+    return width
 
 
 def _slides_batch_request_guidance() -> str:
@@ -148,7 +173,15 @@ def _find_created_slide_ids(requests: List[Dict[str, Any]]) -> Set[str]:
     return slide_ids
 
 
-async def _get_presentation_slide_ids(service, presentation_id: str) -> Set[str]:
+async def _get_presentation_page_ids(
+    service, presentation_id: str
+) -> Tuple[Set[str], Dict[str, str]]:
+    """Return every page object ID plus a notes page ID -> speaker notes shape ID map.
+
+    The speaker notes shape is the only writable part of a notes page, so the map
+    lets an insertText aimed at a notes page be redirected to the shape that can
+    actually hold the text. See https://developers.google.com/slides/api/guides/notes
+    """
     result = await asyncio.to_thread(
         service.presentations()
         .get(
@@ -163,14 +196,20 @@ async def _get_presentation_slide_ids(service, presentation_id: str) -> Set[str]
         for page in result.get(page_type, [])
         if isinstance(page.get("objectId"), str)
     }
+    speaker_notes_shapes: Dict[str, str] = {}
     for slide in result.get("slides", []):
-        notes_id = slide.get("slideProperties", {}).get("notesPage", {}).get("objectId")
-        if isinstance(notes_id, str):
-            page_ids.add(notes_id)
+        notes_page = slide.get("slideProperties", {}).get("notesPage", {})
+        notes_id = notes_page.get("objectId")
+        if not isinstance(notes_id, str):
+            continue
+        page_ids.add(notes_id)
+        shape_id = notes_page.get("notesProperties", {}).get("speakerNotesObjectId")
+        if isinstance(shape_id, str) and shape_id:
+            speaker_notes_shapes[notes_id] = shape_id
     notes_master = result.get("notesMaster")
     if isinstance(notes_master, dict) and isinstance(notes_master.get("objectId"), str):
         page_ids.add(notes_master["objectId"])
-    return page_ids
+    return page_ids, speaker_notes_shapes
 
 
 async def validate_insert_text_targets(
@@ -180,27 +219,174 @@ async def validate_insert_text_targets(
     if not insert_text_targets:
         return
 
-    slide_ids = _find_created_slide_ids(requests)
-    slide_ids.update(await _get_presentation_slide_ids(service, presentation_id))
+    page_ids = _find_created_slide_ids(requests)
+    presentation_page_ids, speaker_notes_shapes = await _get_presentation_page_ids(
+        service, presentation_id
+    )
+    page_ids.update(presentation_page_ids)
 
     invalid_targets = [
         (index, object_id)
         for index, object_id in insert_text_targets
-        if object_id in slide_ids
+        if object_id in page_ids
     ]
     if not invalid_targets:
         return
 
-    invalid_refs = ", ".join(
-        f"requests[{index}].insertText.objectId='{object_id}'"
-        for index, object_id in invalid_targets
-    )
+    problems = []
+    has_non_notes_target = False
+    for index, object_id in invalid_targets:
+        ref = f"requests[{index}].insertText.objectId='{object_id}'"
+        shape_id = speaker_notes_shapes.get(object_id)
+        if shape_id:
+            problems.append(
+                f"{ref} targets a notes page. Speaker notes text lives in the notes "
+                f"shape on that page, so use objectId '{shape_id}' instead."
+            )
+        else:
+            has_non_notes_target = True
+            problems.append(f"{ref} targets a slide/page object.")
+
+    message = "Invalid Slides batch update request: " + " ".join(problems)
+    if has_non_notes_target:
+        message += (
+            " The Slides API only allows insertText on text-capable shapes or table "
+            "cells. Create a text box or shape first with createShape, set "
+            "elementProperties.pageObjectId to the slide ID, then insertText into "
+            'the new shape objectId. For existing content, call get_presentation with action="page" and use a '
+            "Shape or Table element ID, not the Page ID."
+        )
+    raise UserInputError(message)
+
+
+# --- get_presentation actions --------------------------------------------------
+
+GET_PRESENTATION_ACTIONS = ("deck", "layouts", "page", "markup")
+
+# What the page digest needs from the deck to say what the layout and master
+# draw: their non-placeholder elements.
+_PAGE_CONTEXT_FIELDS = (
+    "layouts(objectId,pageElements(objectId,shape(placeholder))),"
+    "masters(objectId,pageElements(objectId,shape(placeholder)))"
+)
+_LAYOUTS_FIELDS = (
+    "slides(objectId,slideProperties(layoutObjectId,masterObjectId)),"
+    "layouts(objectId,layoutProperties,pageElements(objectId,shape(placeholder))),"
+    "masters(objectId,masterProperties)"
+)
+
+
+def _check_targets(page: Dict[str, Any], targets: List[str]) -> None:
+    """Refuse a target that is not on the page, naming the closest IDs."""
+    present = {
+        el.get("objectId") for el, _ in iter_elements(page.get("pageElements", []))
+    }
+    missing = [t for t in targets if t != "notes" and t not in present]
+    if not missing:
+        return
+    hints = []
+    for target in missing:
+        close = difflib.get_close_matches(target, sorted(present), n=3, cutoff=0.6)
+        hints.append(
+            f"'{target}'" + (f" (did you mean {', '.join(close)}?)" if close else "")
+        )
     raise UserInputError(
-        "Invalid Slides batch update request: "
-        f"{invalid_refs} targets a slide/page object. The Slides API only allows "
-        "insertText on text-capable shapes or table cells. Create a text box or "
-        "shape first with createShape, set elementProperties.pageObjectId to the "
-        "slide ID, then insertText into the new shape objectId. For existing "
-        "content, call get_page and use a Shape or Table element ID, not the "
-        "Page ID."
+        f"Not on page {page.get('objectId')}: {'; '.join(hints)}. "
+        'get_presentation(action="page") lists every element ID on the page.'
     )
+
+
+def _prune_page(page: Dict[str, Any], targets: List[str]) -> Dict[str, Any]:
+    """The raw Page resource with pageElements limited to ``targets``.
+
+    A target inside a group is returned on its own, with its transform still
+    relative to the group; a target that is a group keeps its descendants.
+    Speaker notes are kept only when "notes" is a target.
+    """
+    wanted = set(targets)
+    pruned = {k: v for k, v in page.items() if k != "pageElements"}
+    pruned["pageElements"] = [
+        el
+        for el, ancestors in iter_elements(page.get("pageElements", []))
+        if el.get("objectId") in wanted
+        and not any(group.get("objectId") in wanted for group in ancestors)
+    ]
+    if "notes" not in wanted and "slideProperties" in pruned:
+        pruned["slideProperties"] = {
+            k: v for k, v in pruned["slideProperties"].items() if k != "notesPage"
+        }
+    return pruned
+
+
+async def read_presentation(
+    service: Any,
+    presentation_id: str,
+    action: str = "deck",
+    page_id: Optional[str] = None,
+    targets: Optional[List[str]] = None,
+    raw: bool = False,
+    offset: int = 0,
+    after: Optional[str] = None,
+) -> str:
+    """Run one get_presentation action and return its text."""
+    action = (action or "deck").lower().strip()
+    if action not in GET_PRESENTATION_ACTIONS:
+        raise UserInputError(
+            f"Invalid action '{action}'. Must be one of: "
+            + ", ".join(f'"{a}"' for a in GET_PRESENTATION_ACTIONS)
+            + "."
+        )
+    presentations = service.presentations()
+
+    if action == "deck":
+        if offset < 0:
+            raise UserInputError(f"offset must be >= 0, got {offset}.")
+        pres = await asyncio.to_thread(
+            presentations.get(presentationId=presentation_id).execute
+        )
+        return format_deck(pres, offset=offset)
+
+    if action == "layouts":
+        pres = await asyncio.to_thread(
+            presentations.get(
+                presentationId=presentation_id, fields=_LAYOUTS_FIELDS
+            ).execute
+        )
+        if after not in (None, "start") and after not in {
+            s.get("objectId") for s in pres.get("slides", [])
+        }:
+            raise UserInputError(
+                f"after='{after}' is not a slide in this presentation. Pass a "
+                'slide ID from get_presentation(action="deck"), or "start".'
+            )
+        lines = format_layouts(pres, after=after)
+        return "\n".join(lines) if lines else "No layouts found."
+
+    if not page_id:
+        raise UserInputError(f"page_id is required for the '{action}' action.")
+
+    # One request at a time: a service's httplib2 connection is not
+    # thread-safe, so concurrent to_thread calls on it fail with SSL errors.
+    page = await asyncio.to_thread(
+        presentations.pages()
+        .get(presentationId=presentation_id, pageObjectId=page_id)
+        .execute
+    )
+    if action == "page":
+        context = await asyncio.to_thread(
+            presentations.get(
+                presentationId=presentation_id, fields=_PAGE_CONTEXT_FIELDS
+            ).execute
+        )
+        return format_page(page, pres=context)
+
+    if targets:
+        _check_targets(page, targets)
+    if raw:
+        body = _prune_page(page, targets) if targets else page
+        return json.dumps(body, ensure_ascii=False, separators=(",", ":"))
+    meta = await asyncio.to_thread(
+        presentations.get(presentationId=presentation_id, fields="pageSize").execute
+    )
+    projection = project_page(page, meta.get("pageSize"), targets=targets or None)
+    return json.dumps(projection, ensure_ascii=False, separators=(",", ":"))

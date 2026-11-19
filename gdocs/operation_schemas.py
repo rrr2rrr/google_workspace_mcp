@@ -8,9 +8,23 @@ LLMs receive a machine-readable contract instead of a free-form object array.
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from typing import Annotated, Any, Literal, Optional, Union
+from zoneinfo import available_timezones
 
-from pydantic import BaseModel, ConfigDict, Field, BeforeValidator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    BeforeValidator,
+    field_validator,
+    model_validator,
+)
+
+
+ParagraphBorderEdge = Literal["top", "bottom", "left", "right", "between"]
+TableBorderEdge = Literal["top", "bottom", "left", "right"]
+_IANA_TIME_ZONES = frozenset(available_timezones())
 
 
 def _coerce_json_str_to_list(v: Any) -> Any:
@@ -49,9 +63,9 @@ class SegmentTargetDocOperation(StrictDocOperation):
     )
 
 
-class InsertTextOperation(SegmentTargetDocOperation):
-    type: Literal["insert_text"]
-    text: str = Field(description="Text to insert.")
+class InsertionLocationOperation(StrictDocOperation):
+    """One explicit location or semantic anchor for an insertion."""
+
     index: Optional[int] = Field(
         default=None,
         description="Insertion index. Omit when end_of_segment=true.",
@@ -60,12 +74,51 @@ class InsertTextOperation(SegmentTargetDocOperation):
         default=False,
         description="Append to the end of the targeted body/segment instead of using index.",
     )
+    after_heading: Optional[str] = Field(
+        default=None,
+        description=(
+            "Insert immediately after the heading paragraph with this exact text, "
+            "resolved to an index at execution time. Errors when it matches zero or "
+            "more than one heading."
+        ),
+    )
+    before_heading: Optional[str] = Field(
+        default=None,
+        description=(
+            "Insert immediately before the heading paragraph with this exact text. "
+            "Errors when it matches zero or more than one heading."
+        ),
+    )
+    anchor_text: Optional[str] = Field(
+        default=None,
+        description=(
+            "Insert relative to this literal text, which must occur exactly once "
+            "within a single paragraph. Use anchor_position to pick which side."
+        ),
+    )
+    anchor_position: Literal["before", "after"] = Field(
+        default="after",
+        description="Which side of anchor_text to insert on. Defaults to 'after'.",
+    )
 
     @model_validator(mode="after")
-    def validate_location(self) -> "InsertTextOperation":
-        if self.end_of_segment == (self.index is not None):
-            raise ValueError("Provide exactly one of 'index' or 'end_of_segment=true'.")
+    def validate_location(self) -> "InsertionLocationOperation":
+        anchors = [self.after_heading, self.before_heading, self.anchor_text]
+        provided = sum(
+            [self.index is not None, self.end_of_segment]
+            + [anchor is not None for anchor in anchors]
+        )
+        if provided != 1:
+            raise ValueError(
+                "Provide exactly one of 'index', 'end_of_segment=true', "
+                "'after_heading', 'before_heading' or 'anchor_text'."
+            )
         return self
+
+
+class InsertTextOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_text"]
+    text: str = Field(description="Text to insert.")
 
 
 class ReplaceTextOperation(SegmentTargetDocOperation):
@@ -89,7 +142,7 @@ class FormatTextOperation(SegmentTargetDocOperation):
     italic: Optional[bool] = None
     underline: Optional[bool] = None
     strikethrough: Optional[bool] = None
-    font_size: Optional[int] = None
+    font_size: Optional[float] = None
     font_family: Optional[str] = None
     font_weight: Optional[int] = None
     text_color: Optional[str] = None
@@ -120,6 +173,15 @@ class UpdateParagraphStyleOperation(SegmentTargetDocOperation):
     page_break_before: Optional[bool] = None
     spacing_mode: Optional[str] = None
     shading_color: Optional[str] = None
+    border_edges: Optional[list[ParagraphBorderEdge]] = Field(
+        default=None,
+        min_length=1,
+        description="Paragraph border edges to update; omit to update top, bottom, left, and right.",
+    )
+    border_color: Optional[str] = None
+    border_width: Optional[float] = None
+    border_padding: Optional[float] = None
+    border_dash: Optional[str] = None
 
 
 class UpdateTableCellStyleOperation(StrictDocOperation):
@@ -137,26 +199,17 @@ class UpdateTableCellStyleOperation(StrictDocOperation):
     column_index: Optional[int] = None
     row_span: Optional[int] = None
     column_span: Optional[int] = None
+    border_edges: Optional[list[TableBorderEdge]] = Field(
+        default=None,
+        min_length=1,
+        description="Table-cell border edges to update; omit to update all four edges.",
+    )
 
 
-class InsertTableOperation(SegmentTargetDocOperation):
+class InsertTableOperation(InsertionLocationOperation, SegmentTargetDocOperation):
     type: Literal["insert_table"]
     rows: int
     columns: int
-    index: Optional[int] = Field(
-        default=None,
-        description="Insertion index. Omit when end_of_segment=true.",
-    )
-    end_of_segment: bool = Field(
-        default=False,
-        description="Append to the end of the targeted body/segment instead of using index.",
-    )
-
-    @model_validator(mode="after")
-    def validate_location(self) -> "InsertTableOperation":
-        if self.end_of_segment == (self.index is not None):
-            raise ValueError("Provide exactly one of 'index' or 'end_of_segment=true'.")
-        return self
 
 
 class InsertTableRowOperation(StrictDocOperation):
@@ -211,41 +264,37 @@ class UpdateTableColumnPropertiesOperation(StrictDocOperation):
     width_type: Optional[str] = None
 
 
-class InsertPageBreakOperation(StrictDocOperation):
+class UpdateTableRowStyleOperation(StrictDocOperation):
+    type: Literal["update_table_row_style"]
+    table_start_index: int
+    row_indices: list[int] = Field(
+        description="Zero-based row indices to style, e.g. [0] for the header row."
+    )
+    min_row_height: Optional[float] = Field(
+        default=None,
+        description="Minimum row height in points.",
+    )
+
+
+class PinTableHeaderRowsOperation(StrictDocOperation):
+    type: Literal["pin_table_header_rows"]
+    table_start_index: int
+    pinned_header_rows_count: int = Field(
+        ge=0,
+        description="Number of leading rows to pin as a repeating header on each "
+        "page. 0 unpins all rows. Use this dedicated request because the "
+        "'tableHeader' value reported in TableRowStyle cannot be set through "
+        "UpdateTableRowStyleRequest.",
+    )
+
+
+class InsertPageBreakOperation(InsertionLocationOperation):
     type: Literal["insert_page_break"]
-    index: Optional[int] = Field(
-        default=None,
-        description="Insertion index. Omit when end_of_segment=true.",
-    )
-    end_of_segment: bool = Field(
-        default=False,
-        description="Append to the end of the body instead of using index.",
-    )
-
-    @model_validator(mode="after")
-    def validate_location(self) -> "InsertPageBreakOperation":
-        if self.end_of_segment == (self.index is not None):
-            raise ValueError("Provide exactly one of 'index' or 'end_of_segment=true'.")
-        return self
 
 
-class InsertSectionBreakOperation(StrictDocOperation):
+class InsertSectionBreakOperation(InsertionLocationOperation):
     type: Literal["insert_section_break"]
-    index: Optional[int] = Field(
-        default=None,
-        description="Insertion index. Omit when end_of_segment=true.",
-    )
-    end_of_segment: bool = Field(
-        default=False,
-        description="Append to the end of the body instead of using index.",
-    )
     section_type: Literal["CONTINUOUS", "NEXT_PAGE"] = "NEXT_PAGE"
-
-    @model_validator(mode="after")
-    def validate_location(self) -> "InsertSectionBreakOperation":
-        if self.end_of_segment == (self.index is not None):
-            raise ValueError("Provide exactly one of 'index' or 'end_of_segment=true'.")
-        return self
 
 
 class FindReplaceOperation(StrictDocOperation):
@@ -353,24 +402,82 @@ class CreateHeaderFooterOperation(StrictDocOperation):
     )
 
 
-class InsertImageOperation(SegmentTargetDocOperation):
+class InsertImageOperation(InsertionLocationOperation, SegmentTargetDocOperation):
     type: Literal["insert_image"]
     image_uri: str = Field(description="Image URL or resolvable image URI.")
-    index: Optional[int] = Field(
-        default=None,
-        description="Insertion index. Omit when end_of_segment=true.",
-    )
     width: Optional[int] = None
     height: Optional[int] = None
-    end_of_segment: bool = Field(
-        default=False,
-        description="Append to the end of the targeted body/segment instead of using index.",
+
+
+class InsertPersonOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_person"]
+    email: str = Field(
+        min_length=1,
+        description="Email of the person to @mention as a smart chip.",
     )
 
+
+class InsertDateOperation(InsertionLocationOperation, SegmentTargetDocOperation):
+    type: Literal["insert_date"]
+    date: str = Field(
+        min_length=1,
+        description="YYYY-MM-DD, or an ISO 8601 timestamp with an offset (displayed in UTC unless timezone is set).",
+    )
+    date_format: Optional[
+        Literal[
+            "DATE_FORMAT_MONTH_DAY_ABBREVIATED",
+            "DATE_FORMAT_MONTH_DAY_FULL",
+            "DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED",
+            "DATE_FORMAT_ISO8601",
+        ]
+    ] = Field(
+        default=None,
+        description="Defaults to DATE_FORMAT_MONTH_DAY_YEAR_ABBREVIATED.",
+    )
+    time_format: Optional[
+        Literal[
+            "TIME_FORMAT_DISABLED",
+            "TIME_FORMAT_HOUR_MINUTE",
+            "TIME_FORMAT_HOUR_MINUTE_TIMEZONE",
+        ]
+    ] = Field(default=None, description="Omit to show no time.")
+    timezone: Optional[str] = Field(
+        default=None,
+        description="IANA time zone ID shown on the chip. Requires time_format TIME_FORMAT_HOUR_MINUTE_TIMEZONE.",
+    )
+
+    @field_validator("date")
+    @classmethod
+    def _validate_date(cls, value: str) -> str:
+        """Accept YYYY-MM-DD or an ISO 8601 timestamp that carries a time zone."""
+        try:
+            if len(value) == 10:
+                datetime.strptime(value, "%Y-%m-%d")
+            else:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if "T" not in value or parsed.tzinfo is None:
+                    raise ValueError(value)
+        except ValueError as exc:
+            raise ValueError(
+                "date must be YYYY-MM-DD or an ISO 8601 timestamp with a time zone, "
+                "e.g. 2026-11-03T09:30:00Z"
+            ) from exc
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _validate_timezone(cls, value: Optional[str]) -> Optional[str]:
+        """Reject names the IANA time zone database does not know."""
+        if value is not None and value not in _IANA_TIME_ZONES:
+            raise ValueError(f"unknown IANA time zone: {value}")
+        return value
+
     @model_validator(mode="after")
-    def validate_location(self) -> "InsertImageOperation":
-        if self.end_of_segment == (self.index is not None):
-            raise ValueError("Provide exactly one of 'index' or 'end_of_segment=true'.")
+    def validate_timezone_format(self) -> "InsertDateOperation":
+        if self.timezone and self.time_format != "TIME_FORMAT_HOUR_MINUTE_TIMEZONE":
+            raise ValueError(
+                "timezone requires time_format TIME_FORMAT_HOUR_MINUTE_TIMEZONE."
+            )
         return self
 
 
@@ -414,6 +521,8 @@ BatchDocOperation = Annotated[
         MergeTableCellsOperation,
         UnmergeTableCellsOperation,
         UpdateTableColumnPropertiesOperation,
+        UpdateTableRowStyleOperation,
+        PinTableHeaderRowsOperation,
         InsertPageBreakOperation,
         InsertSectionBreakOperation,
         FindReplaceOperation,
@@ -425,6 +534,8 @@ BatchDocOperation = Annotated[
         UpdateSectionStyleOperation,
         CreateHeaderFooterOperation,
         InsertImageOperation,
+        InsertPersonOperation,
+        InsertDateOperation,
         InsertDocTabOperation,
         DeleteDocTabOperation,
         UpdateDocTabOperation,

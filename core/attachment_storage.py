@@ -9,10 +9,16 @@ import base64
 import logging
 import os
 import re
+import shutil
+import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import NamedTuple, Optional, Dict
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
+
+from core import config
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,19 @@ _default_dir = str(Path.home() / ".workspace-mcp" / "attachments")
 STORAGE_DIR = (
     Path(os.getenv("WORKSPACE_ATTACHMENT_DIR", _default_dir)).expanduser().resolve()
 )
+
+# Fallback extensions for attachments that arrive without a filename.
+_MIME_TO_EXTENSION = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+    "text/plain": ".txt",
+    "text/html": ".html",
+}
+
+_MAX_FILE_NAME_BYTES = 255
 
 _WINDOWS_RESERVED_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = {
@@ -47,6 +66,11 @@ def sanitize_attachment_filename(filename: Optional[str]) -> str:
     if not filename:
         return "attachment"
 
+    # Normalize Unicode space separators (category "Zs") to a plain ASCII space.
+    filename = "".join(
+        " " if unicodedata.category(ch) == "Zs" else ch for ch in filename
+    )
+
     sanitized = _WINDOWS_RESERVED_FILENAME_CHARS.sub("_", filename).rstrip(" .")
     if not sanitized:
         return "attachment"
@@ -56,6 +80,24 @@ def sanitize_attachment_filename(filename: Optional[str]) -> str:
         sanitized = f"_{sanitized}"
 
     return sanitized
+
+
+def _build_save_name(
+    file_id: str, filename: Optional[str], mime_type: Optional[str]
+) -> str:
+    """Build a collision-free on-disk name, keeping the original stem when given."""
+    if filename:
+        # The full file_id, not a prefix: a truncated one lets two distinct
+        # attachments land on the same path, silently overwriting the first.
+        safe_filename = Path(sanitize_attachment_filename(filename))
+        tail = f"_{file_id}{safe_filename.suffix}"
+        if len(tail.encode()) >= _MAX_FILE_NAME_BYTES:
+            tail = f"_{file_id}"
+        budget = _MAX_FILE_NAME_BYTES - len(tail.encode())
+        # Drop any character split by the byte cut.
+        stem = safe_filename.stem.encode()[:budget].decode(errors="ignore")
+        return f"{stem}{tail}"
+    return f"{file_id}{_MIME_TO_EXTENSION.get(mime_type or '', '')}"
 
 
 class SavedAttachment(NamedTuple):
@@ -89,11 +131,6 @@ class AttachmentStorage:
         Returns:
             SavedAttachment with file_id (UUID) and path (absolute file path)
         """
-        _ensure_storage_dir()
-
-        # Generate unique file ID for metadata tracking
-        file_id = str(uuid.uuid4())
-
         # Decode base64 data
         try:
             file_bytes = base64.urlsafe_b64decode(base64_data)
@@ -101,32 +138,19 @@ class AttachmentStorage:
             logger.error(f"Failed to decode base64 attachment data: {e}")
             raise ValueError(f"Invalid base64 data: {e}")
 
-        # Determine file extension from filename or mime type
-        extension = ""
-        safe_filename = sanitize_attachment_filename(filename)
+        return self.save_attachment_bytes(file_bytes, filename, mime_type)
 
-        if filename:
-            extension = Path(safe_filename).suffix
-        elif mime_type:
-            # Basic mime type to extension mapping
-            mime_to_ext = {
-                "image/jpeg": ".jpg",
-                "image/png": ".png",
-                "image/gif": ".gif",
-                "application/pdf": ".pdf",
-                "application/zip": ".zip",
-                "text/plain": ".txt",
-                "text/html": ".html",
-            }
-            extension = mime_to_ext.get(mime_type, "")
+    def save_attachment_bytes(
+        self,
+        file_bytes: bytes,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> SavedAttachment:
+        """Save an already-decoded attachment without a base64 round trip."""
+        _ensure_storage_dir()
 
-        # Use original filename if available, with UUID suffix for uniqueness
-        if filename:
-            stem = Path(safe_filename).stem
-            ext = Path(safe_filename).suffix
-            save_name = f"{stem}_{file_id[:8]}{ext}"
-        else:
-            save_name = f"{file_id}{extension}"
+        file_id = str(uuid.uuid4())
+        save_name = _build_save_name(file_id, filename, mime_type)
 
         # Save file with restrictive permissions (sensitive email/drive content)
         file_path = STORAGE_DIR / save_name
@@ -139,8 +163,9 @@ class AttachmentStorage:
             try:
                 total_written = 0
                 data_len = len(file_bytes)
+                data_view = memoryview(file_bytes)
                 while total_written < data_len:
-                    written = os.write(fd, file_bytes[total_written:])
+                    written = os.write(fd, data_view[total_written:])
                     if written == 0:
                         raise OSError(
                             "os.write returned 0 bytes; could not write attachment data"
@@ -159,18 +184,89 @@ class AttachmentStorage:
             )
             raise
 
-        # Store metadata
-        expires_at = datetime.now() + timedelta(seconds=self.expiration_seconds)
+        return self._record(
+            file_id, file_path, save_name, filename, mime_type, len(file_bytes)
+        )
+
+    def save_attachment_from_path(
+        self,
+        src_path: str,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> SavedAttachment:
+        """
+        Adopt an already-downloaded file without loading it into memory.
+
+        The counterpart to save_attachment() for payloads that were streamed
+        straight to disk. Nothing here is proportional to the file size, so a
+        multi-gigabyte Drive download costs no RAM (see #994).
+
+        Args:
+            src_path: Path to the downloaded file. Consumed - it is moved into
+                storage, so the caller must not reuse it afterwards.
+            filename: Original filename (optional)
+            mime_type: MIME type (optional)
+
+        Returns:
+            SavedAttachment with file_id (UUID) and path (absolute file path)
+        """
+        _ensure_storage_dir()
+
+        file_id = str(uuid.uuid4())
+        save_name = _build_save_name(file_id, filename, mime_type)
+        file_path = STORAGE_DIR / save_name
+
+        try:
+            # Publish with a fresh mtime so a concurrent sweep cannot expire it.
+            os.utime(src_path, None)
+            # shutil.move degrades to a streamed copy across filesystems, so it
+            # stays memory-safe when the temp dir is on another mount.
+            shutil.move(str(src_path), str(file_path))
+            os.chmod(file_path, 0o600)
+            size = file_path.stat().st_size
+            logger.info(
+                f"Saved attachment file_id={file_id} filename={filename or save_name} "
+                f"({size} bytes) to {file_path}"
+            )
+            return self._record(
+                file_id, file_path, save_name, filename, mime_type, size
+            )
+        except Exception as e:
+            # The move can land before a later finalization step fails, leaving a file in
+            # storage that no metadata entry will ever expire. Drop it rather
+            # than orphan it, but never let cleanup mask the original failure.
+            try:
+                file_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                logger.warning(
+                    f"Failed to remove partially saved attachment {file_path}: "
+                    f"{cleanup_error}"
+                )
+            logger.error(
+                f"Failed to save attachment file_id={file_id} "
+                f"filename={filename or save_name} to {file_path}: {e}"
+            )
+            raise
+
+    def _record(
+        self,
+        file_id: str,
+        file_path: Path,
+        save_name: str,
+        filename: Optional[str],
+        mime_type: Optional[str],
+        size: int,
+    ) -> SavedAttachment:
+        """Record a stored file's metadata and return its handle."""
         self._metadata[file_id] = {
             "file_path": str(file_path),
             "filename": save_name,
             "original_filename": filename,
             "mime_type": mime_type or "application/octet-stream",
-            "size": len(file_bytes),
+            "size": size,
             "created_at": datetime.now(),
-            "expires_at": expires_at,
+            "expires_at": datetime.now() + timedelta(seconds=self.expiration_seconds),
         }
-
         return SavedAttachment(file_id=file_id, path=str(file_path))
 
     def get_attachment_path(self, file_id: str) -> Optional[Path]:
@@ -238,6 +334,41 @@ class AttachmentStorage:
                 logger.warning(f"Failed to delete attachment file {file_path}: {e}")
             del self._metadata[file_id]
 
+    def sweep_expired(self) -> int:
+        """Remove files older than the expiration window based on mtime."""
+        cutoff = time.time() - self.expiration_seconds
+        swept: set[str] = set()
+
+        try:
+            if not STORAGE_DIR.exists():
+                return 0
+
+            for path in STORAGE_DIR.iterdir():
+                try:
+                    if not path.is_file():
+                        continue
+                    if path.stat().st_mtime >= cutoff:
+                        continue
+                    path.unlink()
+                except OSError as e:
+                    logger.warning(f"Failed to remove expired attachment {path}: {e}")
+                    continue
+                swept.add(str(path))
+        except OSError as e:
+            logger.warning(f"Failed to scan attachment storage {STORAGE_DIR}: {e}")
+
+        if swept:
+            stale_ids = [
+                file_id
+                for file_id, metadata in self._metadata.items()
+                if metadata["file_path"] in swept
+            ]
+            for file_id in stale_ids:
+                del self._metadata[file_id]
+            logger.info(f"Swept {len(swept)} expired attachment(s) from {STORAGE_DIR}")
+
+        return len(swept)
+
     def cleanup_expired(self) -> int:
         """
         Clean up expired attachments.
@@ -255,7 +386,7 @@ class AttachmentStorage:
         for file_id in expired_ids:
             self._cleanup_file(file_id)
 
-        return len(expired_ids)
+        return len(expired_ids) + self.sweep_expired()
 
 
 # Global instance
@@ -263,11 +394,62 @@ _attachment_storage: Optional[AttachmentStorage] = None
 
 
 def get_attachment_storage() -> AttachmentStorage:
-    """Get the global attachment storage instance."""
+    """Get the global attachment storage instance.
+
+    Returns the GCS-backed storage instead of local disk when
+    ``WORKSPACE_MCP_FILES_GCS_BUCKET`` is set on an HTTP transport.
+    """
+    # core.gcs_attachment_storage imports this module, so import it lazily.
+    from core.gcs_attachment_storage import (
+        gcs_files_enabled,
+        get_gcs_attachment_storage,
+    )
+
+    if gcs_files_enabled():
+        return get_gcs_attachment_storage()
+
     global _attachment_storage
     if _attachment_storage is None:
         _attachment_storage = AttachmentStorage()
+    _attachment_storage.sweep_expired()
     return _attachment_storage
+
+
+def _trusted_attachment_bases() -> set[tuple[str, str, str]]:
+    """Return the (scheme, host, path prefix) bases of this server's attachment links."""
+    bases: set[tuple[str, str, str]] = set()
+    for base in (
+        config.WORKSPACE_EXTERNAL_URL,
+        f"{config.WORKSPACE_MCP_BASE_URI}:{config.WORKSPACE_MCP_PORT}",
+    ):
+        if not base:
+            continue
+        parsed = urlparse(base)
+        if parsed.scheme and parsed.netloc:
+            bases.add(
+                (parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"))
+            )
+    return bases
+
+
+def resolve_local_attachment(url: str) -> Optional[tuple[Path, Dict]]:
+    """Return (path, metadata) when ``url`` is this server's own /attachments/{id} link."""
+    parsed = urlparse(url)
+    prefix, separator, file_id = parsed.path.rstrip("/").rpartition("/attachments/")
+    if not separator or "/" in file_id:
+        return None
+    base = (parsed.scheme.lower(), parsed.netloc.lower(), prefix)
+    if (parsed.netloc or prefix) and base not in _trusted_attachment_bases():
+        return None
+
+    storage = get_attachment_storage()
+    metadata = storage.get_attachment_metadata(file_id)
+    if metadata is None:
+        return None
+    file_path = storage.get_attachment_path(file_id)
+    if file_path is None:
+        return None
+    return Path(file_path), metadata
 
 
 def get_attachment_url(file_id: str) -> str:
@@ -280,7 +462,29 @@ def get_attachment_url(file_id: str) -> str:
     Returns:
         Full URL to access the attachment
     """
+    from core.gcs_attachment_storage import (
+        gcs_files_enabled,
+        get_gcs_attachment_storage,
+    )
+
+    if gcs_files_enabled():
+        return get_gcs_attachment_storage().get_signed_url(file_id)
+
     from core.config import WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI
+
+    # In stdio mode the attachment route is served by the lazily-started callback
+    # server; bring it up now so the URL we hand out is actually reachable. The
+    # import is local to avoid pulling the FastAPI/uvicorn auth stack into this
+    # lightweight, widely-imported module (matches every other call site, #832).
+    from auth.oauth_callback_server import ensure_stdio_oauth_callback_available
+
+    success, error_msg = ensure_stdio_oauth_callback_available()
+    if not success:
+        logger.warning(
+            "Failed to start stdio attachment server; attachment URL may be "
+            "unreachable: %s",
+            error_msg,
+        )
 
     # Use external URL if set (for reverse proxy scenarios)
     external_url = os.getenv("WORKSPACE_EXTERNAL_URL")
