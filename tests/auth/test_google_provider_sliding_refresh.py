@@ -160,13 +160,13 @@ async def test_initial_login_uses_configured_lifetime(monkeypatch):
     upstream, mapping_ttl = await _upstream_for(provider, token.refresh_token)
 
     assert upstream.refresh_token_expires_at - time.time() == pytest.approx(
-        180 * DAY, abs=60
+        730 * DAY, abs=60
     )
-    assert mapping_ttl == pytest.approx(180 * DAY, abs=60)
+    assert mapping_ttl == pytest.approx(730 * DAY, abs=60)
     refresh_exp = provider.jwt_issuer.verify_token(
         token.refresh_token, expected_token_use="refresh"
     )["exp"]
-    assert refresh_exp - time.time() == pytest.approx(180 * DAY, abs=60)
+    assert refresh_exp - time.time() == pytest.approx(730 * DAY, abs=60)
 
 
 @pytest.mark.asyncio
@@ -181,14 +181,14 @@ async def test_refresh_slides_deadline_forward():
 
     # ...but an actual refresh pushes it forward by the full window.
     assert upstream.refresh_token_expires_at - time.time() == pytest.approx(
-        180 * DAY, abs=60
+        730 * DAY, abs=60
     )
-    assert mapping_ttl == pytest.approx(180 * DAY, abs=60)
+    assert mapping_ttl == pytest.approx(730 * DAY, abs=60)
     assert upstream.refresh_token == "1//google-refresh-token"
     refresh_exp = provider.jwt_issuer.verify_token(
         new.refresh_token, expected_token_use="refresh"
     )["exp"]
-    assert refresh_exp - time.time() == pytest.approx(180 * DAY, abs=60)
+    assert refresh_exp - time.time() == pytest.approx(730 * DAY, abs=60)
 
     # Chain keeps working on subsequent refreshes.
     newer = await _refresh(provider, client, new.refresh_token)

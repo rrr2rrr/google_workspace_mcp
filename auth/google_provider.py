@@ -22,7 +22,9 @@ token responses (both the initial code exchange and every refresh). FastMCP
 then treats each refresh as extending the refresh-token lifetime, turning the
 hard 30-day cliff into a sliding window. If Google does report a lifetime
 (``refresh_token_expires_in``, used for time-limited consent), that value is
-respected instead.
+respected instead. The default window is 2 years: Google itself still
+revokes tokens that go unused for ~6 months, in which case the refresh fails
+and the user reconnects, so a long local TTL is harmless.
 
 FastMCP also hard-codes a 30-day TTL for the refresh-token mapping created at
 initial login; ``exchange_authorization_code`` re-stores it with the real
@@ -45,7 +47,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 logger = logging.getLogger(__name__)
 
 REFRESH_TOKEN_TTL_DAYS_ENV = "WORKSPACE_MCP_OAUTH_REFRESH_TOKEN_TTL_DAYS"
-DEFAULT_REFRESH_TOKEN_TTL_DAYS = 180
+DEFAULT_REFRESH_TOKEN_TTL_DAYS = 730  # 2 years
 
 
 def get_refresh_token_ttl_seconds() -> int:
