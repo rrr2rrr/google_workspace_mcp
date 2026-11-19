@@ -9,10 +9,8 @@ paths: initial code exchange and refresh-token exchange.
 import time
 from urllib.parse import parse_qs
 
-import fastmcp.server.auth.oauth_proxy.proxy as proxy_module
-import httpx2 as httpx  # authlib's httpx_client is built on httpx2
+import httpx2
 import pytest
-from authlib.integrations.httpx_client import AsyncOAuth2Client
 from fastmcp.server.auth.oauth_proxy.models import (
     DEFAULT_REFRESH_TOKEN_EXPIRY_SECONDS,
     ClientCode,
@@ -28,7 +26,7 @@ DAY = 24 * 60 * 60
 SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email"]
 
 
-def _google_token_endpoint(request: httpx.Request) -> httpx.Response:
+def _google_token_endpoint(request: httpx2.Request) -> httpx2.Response:
     form = parse_qs(request.content.decode())
     grant = form["grant_type"][0]
     body = {
@@ -40,19 +38,31 @@ def _google_token_endpoint(request: httpx.Request) -> httpx.Response:
     if grant == "authorization_code":
         body["refresh_token"] = "1//google-refresh-token"
     # Google's refresh response has no refresh_token and no refresh_expires_in.
-    return httpx.Response(200, json=body)
+    return httpx2.Response(200, json=body)
 
 
-@pytest.fixture(autouse=True)
-def mock_google(monkeypatch):
-    transport = httpx.MockTransport(_google_token_endpoint)
+_RealAsyncClient = httpx2.AsyncClient
 
-    class MockedClient(AsyncOAuth2Client):
+
+def _install_google(monkeypatch, endpoint):
+    """Route the real upstream OAuth client's HTTP calls to `endpoint`.
+
+    Patches the httpx2 transport only, so whatever client class FastMCP uses
+    for upstream token calls (its own in 4.x) is exercised for real.
+    """
+    transport = httpx2.MockTransport(endpoint)
+
+    class MockedAsyncClient(_RealAsyncClient):
         def __init__(self, *args, **kwargs):
             kwargs["transport"] = transport
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(proxy_module, "AsyncOAuth2Client", MockedClient)
+    monkeypatch.setattr(httpx2, "AsyncClient", MockedAsyncClient)
+
+
+@pytest.fixture(autouse=True)
+def mock_google(monkeypatch):
+    _install_google(monkeypatch, _google_token_endpoint)
 
 
 def _make_provider(cls):
@@ -221,16 +231,9 @@ async def test_google_reported_lifetime_is_respected(monkeypatch):
         resp = _google_token_endpoint(request)
         body = resp.json()
         body["refresh_token_expires_in"] = 7 * DAY
-        return httpx.Response(200, json=body)
+        return httpx2.Response(200, json=body)
 
-    transport = httpx.MockTransport(endpoint)
-
-    class MockedClient(AsyncOAuth2Client):
-        def __init__(self, *args, **kwargs):
-            kwargs["transport"] = transport
-            super().__init__(*args, **kwargs)
-
-    monkeypatch.setattr(proxy_module, "AsyncOAuth2Client", MockedClient)
+    _install_google(monkeypatch, endpoint)
     provider = _make_provider(SlidingRefreshGoogleProvider)
     _, token = await _connect(provider)
     upstream, _ = await _upstream_for(provider, token.refresh_token)
@@ -242,21 +245,28 @@ async def test_google_reported_lifetime_is_respected(monkeypatch):
 @pytest.mark.asyncio
 async def test_error_responses_untouched(monkeypatch):
     def endpoint(request):
-        return httpx.Response(
+        return httpx2.Response(
             400, json={"error": "invalid_grant", "error_description": "revoked"}
         )
 
-    transport = httpx.MockTransport(endpoint)
-
-    class MockedClient(AsyncOAuth2Client):
-        def __init__(self, *args, **kwargs):
-            kwargs["transport"] = transport
-            super().__init__(*args, **kwargs)
-
-    monkeypatch.setattr(proxy_module, "AsyncOAuth2Client", MockedClient)
+    _install_google(monkeypatch, endpoint)
     provider = _make_provider(SlidingRefreshGoogleProvider)
     oauth_client = provider._create_upstream_oauth_client()
     with pytest.raises(Exception, match="invalid_grant"):
         await oauth_client.refresh_token(
             url=provider._upstream_token_endpoint, refresh_token="revoked"
         )
+
+
+def test_wraps_fastmcp_upstream_client_unmodified():
+    """Guard against relying on a specific client class (prod regression).
+
+    FastMCP 4.x uses its own upstream client without authlib's
+    register_compliance_hook; the wrapper must work with whatever it returns.
+    """
+    import fastmcp.server.auth.oauth_proxy.proxy as proxy_module
+
+    provider = _make_provider(SlidingRefreshGoogleProvider)
+    wrapped = provider._create_upstream_oauth_client()
+    assert isinstance(wrapped._inner, proxy_module.AsyncOAuth2Client)
+    assert wrapped.client_secret == "test-secret-with-enough-entropy-123456"

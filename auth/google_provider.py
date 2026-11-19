@@ -20,8 +20,8 @@ revoked, or until unused for ~6 months. We:
 
 * pass the configured window as ``fallback_refresh_token_expiry_seconds`` so
   the initial login gets it, and
-* register authlib compliance hooks on the upstream OAuth client that add
-  ``refresh_expires_in`` to Google's token responses. FastMCP then treats each
+* wrap the upstream OAuth client so that Google's token responses get a
+  ``refresh_expires_in``. FastMCP then treats each
   refresh as extending the refresh-token lifetime, turning the fixed deadline
   into a sliding window.
 
@@ -37,8 +37,6 @@ from __future__ import annotations
 import logging
 import os
 from typing import Any
-
-from authlib.integrations.httpx_client import AsyncOAuth2Client
 
 from auth.google_oauth_provider import GoogleProvider
 
@@ -67,37 +65,48 @@ def get_refresh_token_ttl_seconds() -> int:
     return DEFAULT_REFRESH_TOKEN_TTL_DAYS * 24 * 60 * 60
 
 
-def _make_refresh_expiry_hook(ttl_seconds: int):
-    """Build an authlib compliance hook that adds ``refresh_expires_in``."""
+def _with_refresh_expiry(token: Any, ttl_seconds: int) -> Any:
+    """Add ``refresh_expires_in`` to a parsed token response if missing."""
+    if not isinstance(token, dict) or "access_token" not in token:
+        return token
+    if token.get("refresh_expires_in"):
+        return token
+    google_ttl = token.get("refresh_token_expires_in")
+    try:
+        google_ttl = int(google_ttl) if google_ttl else None
+    except (TypeError, ValueError):
+        google_ttl = None
+    token["refresh_expires_in"] = google_ttl or ttl_seconds
+    return token
 
-    def hook(resp: Any) -> Any:
-        # ``resp`` is an httpx / httpx2 Response depending on the authlib
-        # version; rebuild it with the same class.
-        if resp.status_code >= 400:
-            return resp
-        try:
-            data: Any = resp.json()
-        except ValueError:  # non-JSON body (json.JSONDecodeError is a ValueError)
-            return resp
-        if not isinstance(data, dict) or "access_token" not in data:
-            return resp
-        if data.get("refresh_expires_in"):
-            return resp
 
-        google_ttl = data.get("refresh_token_expires_in")
-        try:
-            google_ttl = int(google_ttl) if google_ttl else None
-        except (TypeError, ValueError):
-            google_ttl = None
-        data["refresh_expires_in"] = google_ttl or ttl_seconds
+class _SlidingRefreshUpstreamClient:
+    """Wraps the upstream OAuth client and annotates its token responses.
 
-        return type(resp)(
-            status_code=resp.status_code,
-            json=data,
-            request=resp.request,
-        )
+    FastMCP documents that ``_create_upstream_oauth_client`` may return any
+    object exposing ``fetch_token`` / ``refresh_token`` / ``client_secret`` /
+    ``aclose``. Wrapping (instead of relying on a specific client class) keeps
+    this working whether FastMCP uses authlib's client (3.x) or its own
+    httpx2-based one (4.x).
+    """
 
-    return hook
+    def __init__(self, inner: Any, ttl_seconds: int) -> None:
+        self._inner = inner
+        self._ttl_seconds = ttl_seconds
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    async def fetch_token(self, *args: Any, **kwargs: Any) -> Any:
+        token = await self._inner.fetch_token(*args, **kwargs)
+        return _with_refresh_expiry(token, self._ttl_seconds)
+
+    async def refresh_token(self, *args: Any, **kwargs: Any) -> Any:
+        token = await self._inner.refresh_token(*args, **kwargs)
+        return _with_refresh_expiry(token, self._ttl_seconds)
+
+    async def aclose(self) -> None:
+        await self._inner.aclose()
 
 
 class SlidingRefreshGoogleProvider(GoogleProvider):
@@ -115,11 +124,9 @@ class SlidingRefreshGoogleProvider(GoogleProvider):
             ttl // 86400,
         )
 
-    def _create_upstream_oauth_client(self) -> AsyncOAuth2Client:
-        client = super()._create_upstream_oauth_client()
-        hook = _make_refresh_expiry_hook(self._refresh_token_ttl_seconds)
-        # access_token_response: initial authorization-code exchange.
-        # refresh_token_response: every upstream refresh (explicit and transparent).
-        client.register_compliance_hook("access_token_response", hook)
-        client.register_compliance_hook("refresh_token_response", hook)
-        return client
+    def _create_upstream_oauth_client(self) -> Any:
+        # Covers the initial authorization-code exchange (fetch_token) and every
+        # upstream refresh, explicit and transparent (refresh_token).
+        return _SlidingRefreshUpstreamClient(
+            super()._create_upstream_oauth_client(), self._refresh_token_ttl_seconds
+        )
